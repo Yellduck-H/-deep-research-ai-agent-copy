@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@ai-sdk/deepseek": "^0.2.14",
     "@ai-sdk/react": "^1.2.12",
     "@hookform/resolvers": "^5.0.1",
     "@openrouter/ai-sdk-provider": "^0.4.6",
