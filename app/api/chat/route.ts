@@ -1,175 +1,138 @@
-import { Message, streamText } from 'ai';
-import { NextRequest, NextResponse } from 'next/server';
-import { createDeepSeek } from '@ai-sdk/deepseek'; // 导入 DeepSeek provider
-import Exa from 'exa-js'; // 导入 Exa SDK
+import { Message } from 'ai';
+import Exa from 'exa-js';
 
-export const runtime = 'edge'; // 推荐用于 AI SDK 的 Vercel Edge Runtime
+// 获取环境变量中的API密钥
+const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
+const exaApiKey = process.env.EXA_API_KEY;
 
-// 初始化 DeepSeek Provider
-// 请确保在环境变量中设置了 DEEPSEEK_API_KEY
-const deepseekProvider = createDeepSeek({
-  // apiKey 将从 process.env.DEEPSEEK_API_KEY 读取
-  // 如果 apiKey 未在此处提供，它会默认查找 DEEPSEEK_API_KEY
-  // 为明确起见，我们也可以直接传递: apiKey: process.env.DEEPSEEK_API_KEY
-});
+// 基本系统提示词
+const systemPrompt = `你是一个专业的研究助手，可以帮助用户深入分析研究主题、提出澄清性问题、生成最佳搜索查询，并整合信息编写研究报告。
+当用户询问一个研究主题时，你应该：
+1. 分析主题并确定研究范围
+2. 如有必要，提出澄清性问题以便更好地理解用户需求
+3. 如需要外部信息，使用 [SEARCH: 你的搜索查询] 格式明确指出
+4. 根据已有知识提供初步分析
 
-// 初始化 Exa 客户端
-// 注意：这里我们只声明，但在实际使用时才会创建实例
-// 这样可以避免在不需要搜索时也初始化 Exa 客户端
-let exaClient: Exa | null = null;
+请保持专业、客观、有帮助的态度。`;
 
-// 系统提示，指导 LLM 扮演研究助手的角色
-const SYSTEM_PROMPT = `你是一个专业的研究助手，能够进行深入分析、提出澄清问题，并在需要时生成搜索查询。
-当你需要查找最新信息或特定事实时，请使用以下格式来指示需要搜索：[SEARCH: 你的搜索查询]
-例如：[SEARCH: 2023年人工智能领域的突破性研究]
-我会根据你的搜索查询获取相关信息，然后你可以基于这些信息提供更全面的回答。`;
-
-// 从 LLM 响应中提取搜索查询的函数
+// 从LLM响应中提取搜索查询
 function extractSearchQuery(content: string): string | null {
-  // 使用正则表达式匹配 [SEARCH: xxx] 格式的内容
   const match = content.match(/\[SEARCH:\s*(.*?)\]/);
   return match ? match[1].trim() : null;
 }
 
-export async function POST(req: NextRequest) {
-  // console.log('[API CHAT DEBUG] Received request to /api/chat');
+export async function POST(req: Request) {
+  // 确保API密钥已配置
+  if (!deepseekApiKey) {
+    return new Response("DeepSeek API密钥未配置", { status: 500 });
+  }
+
   try {
-    // 检查必要的环境变量
-    if (!process.env.DEEPSEEK_API_KEY) {
-      // console.error('[API CHAT DEBUG] DEEPSEEK_API_KEY is missing');
-      return NextResponse.json(
-        { error: 'Missing DEEPSEEK_API_KEY in environment variables.' },
-        { status: 500 }
+    // 解析请求体
+    const { messages } = await req.json();
+
+    // 添加系统提示到消息列表
+    const messagesWithSystemPrompt: Message[] = [
+      { role: 'system', content: systemPrompt },
+      ...messages,
+    ];
+
+    // 步骤1: LLM初步分析
+    const initialResponse = await fetchLLMResponse(messagesWithSystemPrompt);
+    
+    // 从初步分析中提取搜索查询
+    const searchQuery = extractSearchQuery(initialResponse);
+    
+    // 如果没有提取到搜索查询，直接返回初步分析结果
+    if (!searchQuery || !exaApiKey) {
+      return new Response(
+        JSON.stringify({ role: "assistant", content: initialResponse }),
+        { headers: { 'Content-Type': 'application/json' } }
       );
     }
-    // console.log('[API CHAT DEBUG] DEEPSEEK_API_KEY is present');
-
-    // 解析请求体
-    const { messages }: { messages: Message[] } = await req.json();
-    // console.log('[API CHAT DEBUG] Request body parsed:', messages);
-
-    // 第一步：LLM 初步分析
-    const messagesWithSystemPrompt: Message[] = [
-      { role: 'system', content: SYSTEM_PROMPT } as Message,
-      ...messages
+    
+    // 步骤2: 调用搜索API
+    const searchResults = await performSearch(searchQuery);
+    
+    // 步骤3: LLM整合搜索结果
+    const formattedSearchResults = formatSearchResults(searchResults, searchQuery);
+    
+    // 创建包含搜索结果的新消息列表
+    const messagesWithSearchResults: Message[] = [
+      { role: 'system', content: systemPrompt },
+      ...messages,
+      { 
+        role: 'assistant', 
+        content: `我需要搜索一些信息来回答你的问题。我搜索的查询是: "${searchQuery}"`
+      },
+      { 
+        role: 'system', 
+        content: `以下是关于"${searchQuery}"的搜索结果:\n\n${formattedSearchResults}\n\n请基于这些信息提供一个全面的回答。`
+      }
     ];
-    // console.log('[API CHAT DEBUG] Messages for initial LLM call:', messagesWithSystemPrompt);
+    
+    // 获取最终结果
+    const finalResponse = await fetchLLMResponse(messagesWithSearchResults);
+    
+    // 返回最终结果
+    return new Response(
+      JSON.stringify({ role: "assistant", content: finalResponse }),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+  } catch (error) {
+    console.error("API路由错误:", error);
+    return new Response("处理请求时出错", { status: 500 });
+  }
+}
 
-    // 调用 LLM 进行初步分析
-    // console.log('[API CHAT DEBUG] Calling initial streamText...');
-    const initialAnalysisResult = await streamText({
-      model: deepseekProvider.chat('deepseek-chat'),
-      messages: messagesWithSystemPrompt,
-    });
-    // console.log('[API CHAT DEBUG] Initial streamText call completed.');
+// 调用DeepSeek API获取LLM回应
+async function fetchLLMResponse(messages: Message[]): Promise<string> {
+  const response = await fetch('https://api.deepseek.com/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${deepseekApiKey}`,
+    },
+    body: JSON.stringify({
+      model: 'deepseek-chat',
+      messages,
+      temperature: 0.7,
+      max_tokens: 2000,
+    }),
+  });
 
-    // ---- 修改：尝试直接读取 textStream ----
-    let accumulatedText = "";
-    // console.log('[API CHAT DEBUG] Starting to read textStream directly...');
-    try {
-      for await (const textPart of initialAnalysisResult.textStream) {
-        // console.log('[API CHAT DEBUG] Stream textPart received:', textPart);
-        accumulatedText += textPart;
-      }
-      // console.log('[API CHAT DEBUG] Stream finished.');
-    } catch (streamError) {
-      // console.error('[API CHAT DEBUG] Error while reading textStream directly:', streamError);
-    }
-    // console.log('[API CHAT DEBUG] Accumulated text from stream:', accumulatedText);
-    const initialResponse = accumulatedText; // 使用累积的文本
-    // ---- 结束修改 ----
-    
-    // console.log('[API CHAT DEBUG] Awaiting initialAnalysisResult.text...'); // 注释掉原来的 .text
-    // const initialResponse = await initialAnalysisResult.text; // 注释掉原来的 .text
-    // console.log('[API CHAT DEBUG] initialResponse (from direct stream read) received:', initialResponse);
-    
-    // 第二步：识别搜索需求
-    const searchQuery = extractSearchQuery(initialResponse);
-    // console.log('[API CHAT DEBUG] Extracted search query:', searchQuery);
-    
-    // 如果没有识别到搜索查询，直接返回初始分析结果
-    if (!searchQuery) {
-      // console.log('[API CHAT DEBUG] No search query found. Returning initialAnalysisResult.toDataStreamResponse().');
-      return initialAnalysisResult.toDataStreamResponse();
-    }
-    
-    // 第三步：调用搜索 API（如果识别到了搜索查询）
-    // console.log(`[API CHAT DEBUG] Search query identified: ${searchQuery}`);
-    
-    // 检查 EXA_API_KEY
-    if (!process.env.EXA_API_KEY) {
-      // console.error('[API CHAT DEBUG] EXA_API_KEY is missing, skipping search');
-      // console.log('[API CHAT DEBUG] Returning initialAnalysisResult.toDataStreamResponse() due to missing EXA_API_KEY.');
-      return initialAnalysisResult.toDataStreamResponse();
-    }
-    // console.log('[API CHAT DEBUG] EXA_API_KEY is present.');
-    
-    try {
-      // 初始化 Exa 客户端（如果还没有初始化）
-      if (!exaClient) {
-        // console.log('[API CHAT DEBUG] Initializing Exa client...');
-        exaClient = new Exa(process.env.EXA_API_KEY);
-        // console.log('[API CHAT DEBUG] Exa client initialized.');
-      }
-      
-      // 调用 Exa 搜索 API
-      // console.log(`[API CHAT DEBUG] Calling Exa search with query: "${searchQuery}"`);
-      const searchResults = await exaClient.search(searchQuery, {
-        numResults: 3,
-      });
-      // console.log('[API CHAT DEBUG] Exa search completed. Results:', searchResults);
-      
-      const formattedSearchResults = searchResults.results.map((result, index) => {
-        return `[搜索结果 ${index + 1}]
+  const data = await response.json();
+  if (data.choices && data.choices.length > 0 && data.choices[0].message) {
+    return data.choices[0].message.content;
+  } else {
+    // 处理可能的错误或意外的响应结构
+    console.error("DeepSeek API response error or unexpected structure:", data);
+    throw new Error("Failed to get a valid response from DeepSeek API.");
+  }
+}
+
+// 执行搜索查询
+async function performSearch(query: string) {
+  // 初始化Exa客户端
+  const exaClient = new Exa(exaApiKey!);
+
+  // 调用Exa搜索API
+  return await exaClient.search(query, {
+    numResults: 3,
+  });
+}
+
+// 格式化搜索结果
+function formatSearchResults(searchResults: any, query: string): string {
+  if (!searchResults || !searchResults.results || searchResults.results.length === 0) {
+    return `未找到关于"${query}"的搜索结果。`;
+  }
+
+  return searchResults.results.map((result: any, index: number) => {
+    return `[搜索结果 ${index + 1}]
 标题: ${result.title || '无标题'}
 链接: ${result.url}
 发布日期: ${result.publishedDate || '未知'}
 ${'-'.repeat(50)}`;
-      }).join('\n\n');
-      // console.log('[API CHAT DEBUG] Search results formatted.');
-      
-      // 第四步：LLM 整合结果
-      const messagesWithSearchResults: Message[] = [
-        { role: 'system', content: SYSTEM_PROMPT } as Message,
-        ...messages,
-        { 
-          role: 'assistant', 
-          content: `我需要搜索一些信息来回答你的问题。我搜索的查询是: "${searchQuery}"`
-        } as Message,
-        { 
-          role: 'system', 
-          content: `以下是关于"${searchQuery}"的搜索结果:\n\n${formattedSearchResults}\n\n请基于这些信息提供一个全面的回答。`
-        } as Message
-      ];
-      // console.log('[API CHAT DEBUG] Messages for final LLM call:', messagesWithSearchResults);
-      
-      // 调用 LLM 进行最终分析
-      // console.log('[API CHAT DEBUG] Calling final streamText...');
-      const finalAnalysisResult = await streamText({
-        model: deepseekProvider.chat('deepseek-chat'),
-        messages: messagesWithSearchResults,
-      });
-      // console.log('[API CHAT DEBUG] Final streamText call completed.');
-      
-      // 返回最终分析结果
-      // console.log('[API CHAT DEBUG] Returning finalAnalysisResult.toDataStreamResponse().');
-      return finalAnalysisResult.toDataStreamResponse();
-      
-    } catch (searchError) {
-      // console.error('[API CHAT DEBUG] Error during search process:', searchError);
-      // console.log('[API CHAT DEBUG] Returning initialAnalysisResult.toDataStreamResponse() due to search error.');
-      // 保留实际的错误处理逻辑，而不是调试日志
-      console.error('[API CHAT] Search process error:', searchError);
-      return initialAnalysisResult.toDataStreamResponse(); // Fallback to initial result
-    }
-
-  } catch (error) {
-    // console.error('[API CHAT DEBUG] Outer catch block error:', error);
-    // 保留实际的错误处理逻辑
-    console.error('[API CHAT] POST request error:', error);
-    if (error instanceof SyntaxError) {
-      return NextResponse.json({ error: 'Invalid JSON in request body' }, { status: 400 });
-    }
-    return NextResponse.json({ error: 'Internal Server Error from API', details: (error as Error).message }, { status: 500 });
-  }
+  }).join('\n\n');
 } 
