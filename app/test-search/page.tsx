@@ -4,83 +4,109 @@ import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 
 export default function TestSearchPage() {
   const [query, setQuery] = useState('');
-  const [response, setResponse] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [numResults, setNumResults] = useState(5);
+  const [results, setResults] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
 
-  const handleSubmit = async () => {
+  const handleSearch = async () => {
     if (!query.trim()) return;
-
-    setIsLoading(true);
-    setError(null);
-    setResponse('');
-
+    
+    setLoading(true);
+    setError('');
+    
     try {
-      const res = await fetch('/api/search', {
+      const response = await fetch('/api/search', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          query: query,
-        }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, numResults }),
       });
-
-      if (!res.ok) {
-        const errorText = await res.text();
-        throw new Error(`API request failed with status ${res.status}: ${errorText}`);
+      
+      const data = await response.json();
+      
+      if (!response.ok) {
+        throw new Error(data.error || '搜索请求失败');
       }
-
-      const data = await res.json();
-      setResponse(JSON.stringify(data, null, 2));
-    } catch (err: any) {
-      setError(err.message);
-      console.error("Test search page error:", err);
+      
+      setResults(data.results || []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '搜索过程中发生错误');
+      setResults([]);
     } finally {
-      setIsLoading(false);
+      setLoading(false);
     }
   };
 
   return (
-    <div className="container mx-auto p-4">
-      <h1 className="text-2xl font-bold mb-4">API Search Test Page</h1>
+    <div className="container py-8">
+      <h1 className="text-3xl font-bold mb-6">搜索 API 测试</h1>
       
-      <div className="space-y-4">
-        <div>
-          <Label htmlFor="query-input">Search Query:</Label>
-          <Input
-            id="query-input"
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Type your search query here..."
-            disabled={isLoading}
-          />
+      <div className="mb-6 space-y-4">
+        <div className="grid grid-cols-1 gap-4">
+          <div>
+            <Label htmlFor="query">搜索关键词</Label>
+            <Input 
+              id="query" 
+              value={query} 
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="输入搜索关键词..."
+              className="w-full"
+            />
+          </div>
+          
+          <div>
+            <Label htmlFor="numResults">结果数量</Label>
+            <Input 
+              id="numResults" 
+              type="number" 
+              min="1" 
+              max="20" 
+              value={numResults} 
+              onChange={(e) => setNumResults(Number(e.target.value))}
+              className="w-full"
+            />
+          </div>
         </div>
         
-        <Button onClick={handleSubmit} disabled={isLoading}>
-          {isLoading ? 'Sending...' : 'Send to /api/search'}
+        <Button onClick={handleSearch} disabled={loading}>
+          {loading ? '搜索中...' : '执行搜索'}
         </Button>
-        
-        {response && (
-          <div>
-            <h2 className="text-xl font-semibold mt-4">API Response:</h2>
-            <pre className="bg-gray-100 dark:bg-gray-800 p-4 rounded-md overflow-x-auto">
-              {response}
-            </pre>
-          </div>
-        )}
-        
-        {error && (
-          <div>
-            <h2 className="text-xl font-semibold mt-4 text-red-500">Error:</h2>
-            <pre className="bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300 p-4 rounded-md overflow-x-auto">
-              {error}
-            </pre>
-          </div>
+      </div>
+      
+      {error && (
+        <div className="p-4 mb-6 bg-red-50 text-red-500 rounded-md border border-red-200">
+          错误: {error}
+        </div>
+      )}
+      
+      <div className="space-y-4">
+        {results.length > 0 ? (
+          <>
+            <h2 className="text-2xl font-bold">搜索结果 ({results.length})</h2>
+            {results.map((result, index) => (
+              <Card key={index}>
+                <CardHeader>
+                  <CardTitle>{result.title}</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <p className="mb-2 text-sm text-gray-500">
+                    {result.publishedDate && `发布日期: ${result.publishedDate} | `}
+                    {result.author && `作者: ${result.author} | `}
+                    <a href={result.url} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">
+                      访问链接
+                    </a>
+                  </p>
+                  <p className="text-sm">{result.text}</p>
+                </CardContent>
+              </Card>
+            ))}
+          </>
+        ) : (
+          !loading && !error && <p>请输入关键词执行搜索。</p>
         )}
       </div>
     </div>
