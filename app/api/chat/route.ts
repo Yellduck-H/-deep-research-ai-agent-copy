@@ -1,5 +1,6 @@
-import { Message } from 'ai';
+import { CoreMessage, streamText } from 'ai';
 import Exa from 'exa-js';
+import { deepseek } from '@ai-sdk/deepseek'; // 假设 deepseek provider 这样导入
 
 // 获取环境变量中的API密钥
 const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
@@ -17,8 +18,35 @@ const systemPrompt = `你是一个专业的研究助手，可以帮助用户深�
 
 // 从LLM响应中提取搜索查询
 function extractSearchQuery(content: string): string | null {
-  const match = content.match(/\[SEARCH:\s*(.*?)\]/);
+  const match = content.match(/\[SEARCH:\\s*(.*?)\]/);
   return match ? match[1].trim() : null;
+}
+
+// 使用新的 streamText API 进行非流式获取 (hacky way, by consuming the stream)
+async function fetchLLMResponseNonStreaming(messages: CoreMessage[]): Promise<string> {
+  const result = await streamText({
+    model: deepseek('deepseek-chat'),
+    messages,
+    temperature: 0.7,
+    maxTokens: 2000,
+    // stream: false, // streamText 默认就是流式，没有 stream: false 选项
+  });
+
+  let content = '';
+  for await (const part of result.textStream) {
+    content += part;
+  }
+  
+  if (content) {
+    return content;
+  } else {
+    // 更详细的错误处理或日志记录会更好
+    console.error("DeepSeek API (non-streaming via streamText) response error or empty content.");
+    // 尝试从原始响应获取更多信息（如果可用）
+    // const fullResponse = await result.response; // 这可能不存在或有不同结构
+    // console.error("Full response object (if available):", fullResponse);
+    throw new Error("Failed to get a valid non-streaming response from DeepSeek API using streamText.");
+  }
 }
 
 export async function POST(req: Request) {
@@ -32,84 +60,92 @@ export async function POST(req: Request) {
     const { messages } = await req.json();
 
     // 添加系统提示到消息列表
-    const messagesWithSystemPrompt: Message[] = [
+    const messagesWithSystemPrompt: CoreMessage[] = [
       { role: 'system', content: systemPrompt },
-      ...messages,
+      ...messages.map((msg: any) => ({ role: msg.role, content: msg.content })), // 确保消息格式正确
     ];
 
-    // 步骤1: LLM初步分析
-    const initialResponse = await fetchLLMResponse(messagesWithSystemPrompt);
+    // 步骤1: LLM初步分析 (非流式，用于提取搜索查询)
+    const initialResponseContent = await fetchLLMResponseNonStreaming(messagesWithSystemPrompt);
     
-    // 从初步分析中提取搜索查询
-    const searchQuery = extractSearchQuery(initialResponse);
+    const searchQuery = extractSearchQuery(initialResponseContent);
     
-    // 如果没有提取到搜索查询，直接返回初步分析结果
     if (!searchQuery || !exaApiKey) {
-      return new Response(
-        JSON.stringify({ role: "assistant", content: initialResponse }),
-        { headers: { 'Content-Type': 'application/json' } }
-      );
+      // 如果没有搜索查询或Exa key，直接以流式返回初步分析结果
+      const result = await streamText({
+        model: deepseek('deepseek-chat'),
+        messages: messagesWithSystemPrompt,
+        temperature: 0.7,
+        maxTokens: 2000,
+      });
+      // if (!response.ok) { // streamText 不直接返回 response.ok
+      //   const errorBody = await response.text();
+      //   throw new Error(`DeepSeek API request failed: ${response.status} ${errorBody}`);
+      // }
+      // Vercel AI SDK 的 streamText 返回的结果可以直接转换为 Response
+      return result.toDataStreamResponse();
     }
     
     // 步骤2: 调用搜索API
     const searchResults = await performSearch(searchQuery);
     
-    // 步骤3: LLM整合搜索结果
+    // 步骤3: LLM整合搜索结果 (流式返回)
     const formattedSearchResults = formatSearchResults(searchResults, searchQuery);
     
-    // 创建包含搜索结果的新消息列表
-    const messagesWithSearchResults: Message[] = [
+    const messagesForFinalResponse: CoreMessage[] = [
       { role: 'system', content: systemPrompt },
-      ...messages,
+      ...messages.map((msg: any) => ({ role: msg.role, content: msg.content })), // 确保消息格式正确
       { 
         role: 'assistant', 
-        content: `我需要搜索一些信息来回答你的问题。我搜索的查询是: "${searchQuery}"`
+        content: `我已完成初步分析并提取到搜索查询: "${searchQuery}". 这是初步分析内容:\\n${initialResponseContent}\\n\\n现在，我将使用以下搜索结果来提供更全面的回答:\\n${formattedSearchResults}`
       },
-      { 
-        role: 'system', 
-        content: `以下是关于"${searchQuery}"的搜索结果:\n\n${formattedSearchResults}\n\n请基于这些信息提供一个全面的回答。`
-      }
     ];
     
-    // 获取最终结果
-    const finalResponse = await fetchLLMResponse(messagesWithSearchResults);
-    
-    // 返回最终结果
-    return new Response(
-      JSON.stringify({ role: "assistant", content: finalResponse }),
-      { headers: { 'Content-Type': 'application/json' } }
-    );
+    // 步骤4: LLM整合搜索结果 (流式返回)
+    const finalResult = await streamText({
+      model: deepseek('deepseek-chat'),
+      messages: messagesForFinalResponse,
+      temperature: 0.7,
+      maxTokens: 2000,
+    });
+
+    // if (!finalStreamResponse.ok) { // streamText 不直接返回 response.ok
+    //   const errorBody = await finalStreamResponse.text();
+    //   throw new Error(`DeepSeek API request failed for final response: ${finalStreamResponse.status} ${errorBody}`);
+    // }
+
+    return finalResult.toDataStreamResponse();
   } catch (error) {
     console.error("API路由错误:", error);
-    return new Response("处理请求时出错", { status: 500 });
+    return new Response( error instanceof Error ? error.message : "处理请求时出错", { status: 500 });
   }
 }
 
-// 调用DeepSeek API获取LLM回应
-async function fetchLLMResponse(messages: Message[]): Promise<string> {
-  const response = await fetch('https://api.deepseek.com/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${deepseekApiKey}`,
-    },
-    body: JSON.stringify({
-      model: 'deepseek-chat',
-      messages,
-      temperature: 0.7,
-      max_tokens: 2000,
-    }),
-  });
+// 调用DeepSeek API获取LLM回应 (这个函数不再需要，因为 fetchLLMResponseNonStreaming 和 streamText 直接处理)
+// async function fetchLLMResponse(messages: CoreMessage[]): Promise<string> {
+//   const response = await fetch('https://api.deepseek.com/chat/completions', {
+//     method: 'POST',
+//     headers: {
+//       'Content-Type': 'application/json',
+//       Authorization: `Bearer ${deepseekApiKey}`,
+//     },
+//     body: JSON.stringify({
+//       model: 'deepseek-chat',
+//       messages,
+//       temperature: 0.7,
+//       max_tokens: 2000,
+//     }),
+//   });
 
-  const data = await response.json();
-  if (data.choices && data.choices.length > 0 && data.choices[0].message) {
-    return data.choices[0].message.content;
-  } else {
-    // 处理可能的错误或意外的响应结构
-    console.error("DeepSeek API response error or unexpected structure:", data);
-    throw new Error("Failed to get a valid response from DeepSeek API.");
-  }
-}
+//   const data = await response.json();
+//   if (data.choices && data.choices.length > 0 && data.choices[0].message) {
+//     return data.choices[0].message.content;
+//   } else {
+//     // 处理可能的错误或意外的响应结构
+//     console.error("DeepSeek API response error or unexpected structure:", data);
+//     throw new Error("Failed to get a valid response from DeepSeek API.");
+//   }
+// }
 
 // 执行搜索查询
 async function performSearch(query: string) {
